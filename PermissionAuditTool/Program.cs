@@ -1,6 +1,10 @@
-﻿using System.Security.AccessControl;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security.AccessControl;
 using System.Security.Principal;
-using OfficeOpenXml; // EPPlus
+using OfficeOpenXml;
 
 class PermissionAuditTool
 {
@@ -14,10 +18,10 @@ class PermissionAuditTool
 
         bool recursiveScan = false;
         bool mergeResults = false;
+        bool sharedOnly = false;
         List<string> directoriesToScan = new List<string>();
         string logFilePath = "ErrorLog.txt";
 
-        // Parse command line arguments
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i].ToLower())
@@ -28,12 +32,15 @@ class PermissionAuditTool
                 case "-merge":
                     mergeResults = true;
                     break;
+                case "-sharedonly":
+                    sharedOnly = true;
+                    break;
                 case "-file":
                     if (i + 1 < args.Length && File.Exists(args[i + 1]))
                     {
                         directoriesToScan.AddRange(File.ReadLines(args[i + 1])
                             .Where(line => !string.IsNullOrWhiteSpace(line)));
-                        i++; // Skip the next argument as it's the file path
+                        i++;
                     }
                     else
                     {
@@ -60,25 +67,79 @@ class PermissionAuditTool
             return;
         }
 
+        // Получаем ВСЕ расшаренные папки на машине
+        var allSharedPaths = GetSharedFoldersViaNetShare();
+
+        List<string> finalDirectories = new List<string>();
+
+        foreach (string rootPath in directoriesToScan)
+        {
+            if (sharedOnly)
+            {
+                // Фильтруем расшаренные папки: только те, что внутри rootPath
+                var sharedInRoot = allSharedPaths
+                    .Where(shared => IsSubPath(shared, rootPath))
+                    .ToList();
+
+                if (recursiveScan)
+                {
+                    // Также ищем расшаренные папки в подкаталогах
+                    var sharedInSubdirs = allSharedPaths
+                        .Where(shared => shared.StartsWith(rootPath, StringComparison.OrdinalIgnoreCase) && !IsDirectChild(shared, rootPath))
+                        .ToList();
+                    sharedInRoot.AddRange(sharedInSubdirs);
+                }
+
+                finalDirectories.AddRange(sharedInRoot);
+            }
+            else
+            {
+                // Обычный режим: сканируем rootPath и подкаталоги, если recursive
+                finalDirectories.Add(rootPath);
+                if (recursiveScan)
+                {
+                    try
+                    {
+                        finalDirectories.AddRange(Directory.EnumerateDirectories(rootPath, "*", SearchOption.AllDirectories));
+                    }
+                    catch (UnauthorizedAccessException) { }
+                    catch (IOException) { }
+                }
+            }
+        }
+
+        finalDirectories = finalDirectories.Distinct().OrderBy(d => d).ToList();
+
+        if (finalDirectories.Count == 0)
+        {
+            Console.WriteLine("No directories to scan after filtering.");
+            return;
+        }
+
+        string reportFileName = null;
+
         try
         {
             if (mergeResults)
             {
-                GenerateMergedAccessReport(directoriesToScan, recursiveScan);
+                reportFileName = GenerateMergedAccessReport(finalDirectories);
             }
             else
             {
-                foreach (string directoryPath in directoriesToScan)
+                foreach (string directoryPath in finalDirectories)
                 {
-                    if (Directory.Exists(directoryPath))
-                    {
-                        GenerateAccessReport(directoryPath, recursiveScan);
-                    }
-                    else
-                    {
-                        LogError(directoryPath, logFilePath);
-                    }
+                    reportFileName = GenerateAccessReport(directoryPath);
                 }
+            }
+
+            // Автоматически открыть последний созданный файл
+            if (!string.IsNullOrEmpty(reportFileName) && File.Exists(reportFileName))
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = reportFileName,
+                    UseShellExecute = true // Обязательно для открытия в Windows
+                });
             }
         }
         catch (UnauthorizedAccessException)
@@ -90,7 +151,6 @@ class PermissionAuditTool
             Console.WriteLine($"An error occurred: {ex.Message}");
         }
 
-        // Notify user about the creation of the log file
         if (File.Exists(logFilePath) && new FileInfo(logFilePath).Length > 0)
         {
             Console.WriteLine($"Errors logged to '{logFilePath}'.");
@@ -101,80 +161,168 @@ class PermissionAuditTool
     {
         Console.WriteLine(@"
 Permission Audit Tool Help
-
 Usage: PermissionAuditTool.exe [options] <directoryPath1> [<directoryPath2> ...]
 
 Options:
-  -recursive      Perform a recursive scan of all subdirectories.
-  -merge          Merge results into a single output file.
-  -file <path>    Read a list of directories from a text file.
+  -recursive      Include subdirectories in the scan.
+  -merge          Merge results from multiple directories into a single output file.
+  -sharedonly     Only scan directories that are shared (published as network shares).
+  -file <path>    Read a list of directories from a text file (one per line).
   /?              Display this help message.
 
 Examples:
-  PermissionAuditTool.exe C:\Users\Public
+  PermissionAuditTool.exe C:\temp
   PermissionAuditTool.exe -recursive C:\Projects
-  PermissionAuditTool.exe -file C:\list_of_directories.txt
-  PermissionAuditTool.exe -merge -file C:\list_of_directories.txt
+  PermissionAuditTool.exe -sharedonly C:\temp
+  PermissionAuditTool.exe -sharedonly -recursive C:\temp
+  PermissionAuditTool.exe -merge -sharedonly C:\temp
+  PermissionAuditTool.exe -file directories.txt
 
-Note: The tool will generate an Excel report and log any errors to 'ErrorLog.txt'.
-");
+Note: With -sharedonly, only shared folders within the specified path(s) will be scanned.
+The tool generates an Excel report (.xlsx) and logs errors to 'ErrorLog.txt'.
+The generated report will be opened automatically after creation.");
     }
 
-    static void GenerateAccessReport(string directoryPath, bool recursiveScan)
+    static List<string> GetSharedFoldersViaNetShare()
     {
-        string reportFileName = $"AccessReport_{DateTime.Now:yyyy.MM.dd.HHmmss}_{Path.GetFileName(directoryPath)}.xlsx";
-        using (ExcelPackage excelPackage = new ExcelPackage(new FileInfo(reportFileName)))
+        var sharedPaths = new List<string>();
+        try
         {
-            ExcelWorksheet worksheet = excelPackage.Workbook.Worksheets.Add("Access Report");
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "net",
+                Arguments = "share",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Environment.SystemDirectory
+            };
+
+            using (var process = System.Diagnostics.Process.Start(startInfo))
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit();
+
+                string[] lines = output.Split(
+                    new[] { Environment.NewLine },
+                    StringSplitOptions.None
+                );
+
+                foreach (string line in lines)
+                {
+                    if (string.IsNullOrWhiteSpace(line) ||
+                        line.Contains("Share name", StringComparison.OrdinalIgnoreCase) ||
+                        line.Contains("The command completed successfully", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    int pathStartIndex = -1;
+                    for (int i = 0; i < line.Length - 2; i++)
+                    {
+                        if (char.IsLetter(line[i]) && line[i + 1] == ':' && (line[i + 2] == '\\' || line[i + 2] == '/'))
+                        {
+                            pathStartIndex = i;
+                            break;
+                        }
+                    }
+
+                    if (pathStartIndex != -1)
+                    {
+                        string path = line.Substring(pathStartIndex).Trim();
+                        if (Directory.Exists(path))
+                        {
+                            sharedPaths.Add(Path.GetFullPath(path));
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to retrieve shares via 'net share': {ex.Message}");
+        }
+
+        return sharedPaths.Distinct().ToList();
+    }
+
+    static bool IsSubPath(string child, string parent)
+    {
+        try
+        {
+            var parentUri = new Uri(Path.GetFullPath(parent) + Path.DirectorySeparatorChar);
+            var childUri = new Uri(Path.GetFullPath(child) + Path.DirectorySeparatorChar);
+            return childUri.IsBaseOf(parentUri);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static bool IsDirectChild(string child, string parent)
+    {
+        try
+        {
+            var parentDir = new DirectoryInfo(Path.GetFullPath(parent));
+            var childDir = new DirectoryInfo(Path.GetFullPath(child));
+            return childDir.Parent?.FullName.Equals(parentDir.FullName, StringComparison.OrdinalIgnoreCase) ?? false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static string GenerateAccessReport(string directoryPath)
+    {
+        string fileName = Path.GetFileName(directoryPath);
+        string reportFileName = $"AccessReport_{DateTime.Now:yyyy.MM.dd.HHmmss}_{fileName}.xlsx";
+
+        using (var package = new ExcelPackage(new FileInfo(reportFileName)))
+        {
+            string worksheetName = Path.GetFileName(directoryPath);
+            if (worksheetName.Length > 31) worksheetName = worksheetName.Substring(0, 31);
+            worksheetName = string.Join("_", worksheetName.Split(Path.GetInvalidFileNameChars()));
+
+            var worksheet = package.Workbook.Worksheets.Add(worksheetName);
             PopulateHeaders(worksheet);
-
             int row = 2;
-            var directories = GetDirectories(directoryPath, recursiveScan);
-            ProcessDirectories(directories, worksheet, ref row);
 
-            // Auto-fit columns
-            for (int i = 1; i <= 5; i++)
+            ProcessDirectories(new[] { directoryPath }, worksheet, ref row);
+
+            for (int i = 1; i <= 9; i++)
             {
                 worksheet.Column(i).AutoFit();
             }
 
-            excelPackage.Save();
+            package.Save();
         }
 
         Console.WriteLine($"Report saved to {reportFileName}");
+        return reportFileName;
     }
 
-    static void GenerateMergedAccessReport(List<string> directoriesToScan, bool recursiveScan)
+    static string GenerateMergedAccessReport(List<string> directoriesToScan)
     {
         string reportFileName = $"AccessReport_Merged_{DateTime.Now:yyyy.MM.dd.HHmmss}.xlsx";
-        using (ExcelPackage excelPackage = new ExcelPackage(new FileInfo(reportFileName)))
+
+        using (var package = new ExcelPackage(new FileInfo(reportFileName)))
         {
-            ExcelWorksheet worksheet = excelPackage.Workbook.Worksheets.Add("Access Report");
+            var worksheet = package.Workbook.Worksheets.Add("Merged Access Report");
             PopulateHeaders(worksheet);
-
             int row = 2;
-            foreach (string directoryPath in directoriesToScan)
-            {
-                if (!Directory.Exists(directoryPath))
-                {
-                    LogError(directoryPath, "ErrorLog.txt");
-                    continue;
-                }
 
-                var directories = GetDirectories(directoryPath, recursiveScan);
-                ProcessDirectories(directories, worksheet, ref row);
-            }
+            ProcessDirectories(directoriesToScan, worksheet, ref row);
 
-            // Auto-fit columns
-            for (int i = 1; i <= 5; i++)
+            for (int i = 1; i <= 9; i++)
             {
                 worksheet.Column(i).AutoFit();
             }
 
-            excelPackage.Save();
+            package.Save();
         }
 
         Console.WriteLine($"Merged report saved to {reportFileName}");
+        return reportFileName;
     }
 
     static void PopulateHeaders(ExcelWorksheet worksheet)
@@ -189,82 +337,108 @@ Note: The tool will generate an Excel report and log any errors to 'ErrorLog.txt
         worksheet.Cells[1, 8].Value = "OwnerLogin";
         worksheet.Cells[1, 9].Value = "LastAccessTime";
 
-        // Set date format for LastAccessTime column
-        worksheet.Column(9).Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+        worksheet.Column(9).Style.Numberformat.Format = "dd.MM.yyyy HH:mm:ss";
     }
 
     static void ProcessDirectories(IEnumerable<string> directories, ExcelWorksheet worksheet, ref int row)
     {
-        foreach (var dir in directories)
+        foreach (string dir in directories)
         {
-            Console.Write($"\rProcessing directory: {dir}");
+            Console.Write($"\rProcessing: {dir}");
             AnalyzeDirectory(dir, worksheet, ref row);
         }
     }
 
-    static List<string> GetDirectories(string directoryPath, bool recursiveScan)
-    {
-        var directories = new List<string> { directoryPath };
-
-        if (recursiveScan)
-        {
-            directories.AddRange(Directory.EnumerateDirectories(directoryPath, "*", SearchOption.AllDirectories));
-        }
-
-        return directories.Distinct().OrderBy(d => d).ToList();
-    }
-
     static void AnalyzeDirectory(string directoryPath, ExcelWorksheet worksheet, ref int row)
     {
-        DirectoryInfo directoryInfo = new DirectoryInfo(directoryPath);
-        DirectorySecurity directorySecurity = directoryInfo.GetAccessControl();
-
-        // Correctly get owner information
-        var ownerSid = directoryInfo.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
-        string ownerName = "";
-        string ownerLogin = "";
-
-        if (ownerSid != null)
-        {
-            try
-            {
-                // Try to translate SID to NTAccount
-                ownerName = ownerSid.Translate(typeof(NTAccount)).ToString();
-                ownerLogin = ownerName.Split('\\').LastOrDefault(); // Extract just the username part
-            }
-            catch (IdentityNotMappedException)
-            {
-                // If translation fails, use SID directly
-                ownerName = ownerSid.Value;
-                ownerLogin = ownerName;
-            }
-        }
-
-        // Get last access time (if available)
-        DateTime? lastAccessTime = null;
+        DirectoryInfo dirInfo;
         try
         {
-            lastAccessTime = directoryInfo.LastAccessTime;
+            dirInfo = new DirectoryInfo(directoryPath);
         }
-        catch (UnauthorizedAccessException)
+        catch
         {
-            // Some directories may not have LastAccessTime set due to system policies
+            return;
         }
 
-        foreach (FileSystemAccessRule rule in directorySecurity.GetAccessRules(true, true, typeof(NTAccount)))
+        DirectorySecurity dirSecurity;
+        try
         {
-            bool writeRights = (rule.FileSystemRights & FileSystemRights.Write) == FileSystemRights.Write;
-            bool readRights = (rule.FileSystemRights & FileSystemRights.Read) == FileSystemRights.Read;
+            dirSecurity = dirInfo.GetAccessControl();
+        }
+        catch
+        {
+            return;
+        }
 
-            worksheet.Cells[row, 1].Value = directoryInfo.Name;
-            worksheet.Cells[row, 2].Value = directoryInfo.FullName;
-            worksheet.Cells[row, 3].Value = rule.IdentityReference.Value;
-            worksheet.Cells[row, 4].Value = writeRights;
-            worksheet.Cells[row, 5].Value = readRights;
-            worksheet.Cells[row, 6].Value = rule.FileSystemRights.ToString();
+        string ownerName = "(Unknown)";
+        string ownerLogin = "(Unknown)";
+        try
+        {
+            var ownerSid = dirSecurity.GetOwner(typeof(SecurityIdentifier));
+            if (ownerSid != null)
+            {
+                var account = ownerSid.Translate(typeof(NTAccount)) as NTAccount;
+                ownerName = account?.Value ?? ownerSid.Value;
+                ownerLogin = ownerName.Split('\\').Last();
+            }
+        }
+        catch
+        {
+            ownerName = "(Access Denied)";
+            ownerLogin = "(Access Denied)";
+        }
+
+        string lastAccessTimeStr = "(Not Available)";
+        try
+        {
+            if (dirInfo.Exists)
+                lastAccessTimeStr = dirInfo.LastAccessTime.ToString("dd.MM.yyyy HH:mm:ss");
+        }
+        catch { }
+
+        AuthorizationRuleCollection rules;
+        try
+        {
+            rules = dirSecurity.GetAccessRules(true, true, typeof(NTAccount));
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (FileSystemAccessRule rule in rules)
+        {
+            string accountName;
+            try
+            {
+                accountName = rule.IdentityReference.Translate(typeof(NTAccount)).Value;
+            }
+            catch
+            {
+                accountName = rule.IdentityReference.Value;
+            }
+
+            FileSystemRights rights = rule.FileSystemRights;
+
+            bool hasRead = (rights & (FileSystemRights.ReadData | FileSystemRights.Read)) != 0 ||
+                           (rights & FileSystemRights.ReadAndExecute) != 0 ||
+                           (rights & FileSystemRights.ReadPermissions) != 0;
+
+            bool hasWrite = (rights & (FileSystemRights.WriteData | FileSystemRights.Write)) != 0 ||
+                            (rights & (FileSystemRights.CreateFiles | FileSystemRights.AppendData)) != 0 ||
+                            (rights & FileSystemRights.Modify) != 0 ||
+                            (rights & FileSystemRights.FullControl) != 0;
+
+            worksheet.Cells[row, 1].Value = dirInfo.Name;
+            worksheet.Cells[row, 2].Value = dirInfo.FullName;
+            worksheet.Cells[row, 3].Value = accountName;
+            worksheet.Cells[row, 4].Value = hasWrite;
+            worksheet.Cells[row, 5].Value = hasRead;
+            worksheet.Cells[row, 6].Value = rights.ToString();
             worksheet.Cells[row, 7].Value = ownerName;
             worksheet.Cells[row, 8].Value = ownerLogin;
-            worksheet.Cells[row, 9].Value = lastAccessTime.HasValue ? lastAccessTime.Value : "(Not Available)";
+            worksheet.Cells[row, 9].Value = lastAccessTimeStr;
 
             row++;
         }
@@ -272,10 +446,12 @@ Note: The tool will generate an Excel report and log any errors to 'ErrorLog.txt
 
     static void LogError(string path, string logFilePath)
     {
-        using (StreamWriter writer = File.AppendText(logFilePath))
+        try
         {
-            writer.WriteLine($"Invalid or inaccessible directory: {path}");
+            File.AppendAllText(logFilePath, $"Invalid or inaccessible directory: {path}{Environment.NewLine}");
         }
-        Console.WriteLine($"Error: Invalid or inaccessible directory: {path}. Logged to '{logFilePath}'.");
+        catch { }
+
+        Console.WriteLine($"Error: {path} - logged to '{logFilePath}'");
     }
 }
