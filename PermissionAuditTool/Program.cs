@@ -1,4 +1,8 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using OfficeOpenXml;
@@ -25,7 +29,6 @@ class PermissionAuditTool
         List<string> directoriesToScan = new List<string>();
         string logFilePath = "ErrorLog.txt";
 
-        // Парсинг аргументов
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i].ToLower())
@@ -100,10 +103,10 @@ class PermissionAuditTool
             return;
         }
 
-        // Запрос пароля, если указан username
+        // Запрос пароля
         if (!string.IsNullOrEmpty(username) && string.IsNullOrEmpty(password))
         {
-            Console.Write("Enter password for user '" + username + "': ");
+            Console.Write($"Enter password for '{username}': ");
             password = ReadPassword();
             Console.WriteLine();
         }
@@ -112,12 +115,12 @@ class PermissionAuditTool
 
         try
         {
-            // Аутентификация через net use
+            // Аутентификация
             if (!string.IsNullOrEmpty(username))
             {
-                if (!ConnectToServer(username, password, serverName))
+                if (!ConnectToServer(username, password, serverName ?? "localhost"))
                 {
-                    Console.WriteLine("Failed to authenticate. Check username and password.");
+                    Console.WriteLine("Authentication failed. Check username and password.");
                     return;
                 }
                 isAuthenticated = true;
@@ -125,8 +128,7 @@ class PermissionAuditTool
 
             if (smbSharesOnly)
             {
-                var shares = GetSmbSharesFromServer(serverName);
-                finalDirectories.AddRange(shares);
+                finalDirectories = GetSmbSharesFromServer(serverName);
             }
             else
             {
@@ -186,7 +188,6 @@ class PermissionAuditTool
         }
         finally
         {
-            // Отключение
             if (isAuthenticated)
             {
                 DisconnectAll();
@@ -221,14 +222,14 @@ class PermissionAuditTool
         return password;
     }
 
-    static bool ConnectToServer(string username, string password, string serverName)
+    static bool ConnectToServer(string username, string password, string server)
     {
         try
         {
             var startInfo = new ProcessStartInfo
             {
                 FileName = "net",
-                Arguments = $"use \\\\{serverName}\\IPC$ /user:{username} \"{password}\"",
+                Arguments = $"use \\\\{server}\\IPC$ /user:{username} \"{password}\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -237,10 +238,7 @@ class PermissionAuditTool
 
             using (var process = Process.Start(startInfo))
             {
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
                 process.WaitForExit();
-
                 return process.ExitCode == 0;
             }
         }
@@ -270,84 +268,55 @@ class PermissionAuditTool
     {
         var shares = new List<string>();
 
-        // Определяем, является ли сервер локальным
-        bool isLocalServer = IsLocalMachine(server);
-
-        if (isLocalServer)
+        if (IsLocalMachine(server))
         {
-            // Используем локальный net share
-            shares = GetSharedFoldersViaNetShare();
+            return GetSharedFoldersViaNetShare();
         }
-        else
+
+        try
         {
-            // Используем удалённый PowerShell
-            try
+            var startInfo = new ProcessStartInfo
             {
-                var startInfo = new ProcessStartInfo
-                {
-                    FileName = "powershell.exe",
-                    Arguments = $"-Command \"Get-CimInstance -ComputerName {server} -Class Win32_Share -ErrorAction Stop | Where-Object {{ $_.Type -eq 0 }} | Select-Object -ExpandProperty Path\"",
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
+                FileName = "wmic",
+                Arguments = $"/node:\"{server}\" share where \"Type=0\" get Path /format:value",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
 
-                using (var process = Process.Start(startInfo))
-                {
-                    string output = process.StandardOutput.ReadToEnd();
-                    process.WaitForExit();
+            using (var process = Process.Start(startInfo))
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                string error = process.StandardError.ReadToEnd();
+                process.WaitForExit();
 
-                    if (process.ExitCode == 0)
+                if (process.ExitCode == 0)
+                {
+                    foreach (string line in output.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
                     {
-                        foreach (string line in output.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries))
+                        if (line.Trim().StartsWith("Path="))
                         {
-                            string path = line.Trim();
-                            if (!string.IsNullOrEmpty(path) && Directory.Exists(path))
+                            string path = line.Substring(5).Trim();
+                            if (!string.IsNullOrEmpty(path))
                             {
                                 shares.Add(path);
                             }
                         }
                     }
-                    else
-                    {
-                        Console.WriteLine($"Failed to retrieve shares from {server} via PowerShell.");
-                    }
+                }
+                else
+                {
+                    Console.WriteLine($"WMIC failed: {error}");
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error retrieving shares from {server}: {ex.Message}");
-            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error retrieving shares: {ex.Message}");
         }
 
         return shares;
-    }
-
-    static bool IsLocalMachine(string serverNameOrIp)
-    {
-        try
-        {
-            // Получаем локальные имена
-            string hostName = Environment.MachineName;
-            string fqdn = $"{hostName}.{Environment.GetEnvironmentVariable("USERDNSDOMAIN") ?? ""}".TrimEnd('.');
-            string localhostNames = "localhost,127.0.0.1,::1,.";
-
-            // Получаем локальные IP-адреса
-            var localIps = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
-                .AddressList
-                .Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                .Select(ip => ip.ToString());
-
-            // Проверяем совпадение
-            return string.Equals(serverNameOrIp, hostName, StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(serverNameOrIp, fqdn, StringComparison.OrdinalIgnoreCase) ||
-                   localhostNames.Split(',').Contains(serverNameOrIp, StringComparer.OrdinalIgnoreCase) ||
-                   localIps.Contains(serverNameOrIp);
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     static List<string> GetSharedFoldersViaNetShare()
@@ -392,9 +361,9 @@ class PermissionAuditTool
                     if (pathStartIndex != -1)
                     {
                         string path = line.Substring(pathStartIndex).Trim();
-                        if (Directory.Exists(path))
+                        if (!string.IsNullOrEmpty(path))
                         {
-                            sharedPaths.Add(Path.GetFullPath(path));
+                            sharedPaths.Add(path);
                         }
                     }
                 }
@@ -402,7 +371,7 @@ class PermissionAuditTool
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Failed to retrieve shares via 'net share': {ex.Message}");
+            Console.WriteLine($"Failed to retrieve shares: {ex.Message}");
         }
         return sharedPaths.Distinct().ToList();
     }
@@ -419,6 +388,32 @@ class PermissionAuditTool
             var parentUri = new Uri(Path.GetFullPath(parent) + Path.DirectorySeparatorChar);
             var childUri = new Uri(Path.GetFullPath(child) + Path.DirectorySeparatorChar);
             return childUri.IsBaseOf(parentUri);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static bool IsLocalMachine(string serverNameOrIp)
+    {
+        if (string.IsNullOrEmpty(serverNameOrIp)) return false;
+
+        try
+        {
+            string hostName = Environment.MachineName;
+            string fqdn = $"{hostName}.{Environment.GetEnvironmentVariable("USERDNSDOMAIN") ?? ""}".TrimEnd('.');
+            string[] localNames = { "localhost", "127.0.0.1", "::1", ".", hostName, fqdn };
+
+            if (localNames.Contains(serverNameOrIp, StringComparer.OrdinalIgnoreCase))
+                return true;
+
+            var localIps = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
+                .AddressList
+                .Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                .Select(ip => ip.ToString());
+
+            return localIps.Contains(serverNameOrIp);
         }
         catch
         {
@@ -512,6 +507,16 @@ class PermissionAuditTool
         }
         catch
         {
+            worksheet.Cells[row, 1].Value = "(Access Denied)";
+            worksheet.Cells[row, 2].Value = directoryPath;
+            worksheet.Cells[row, 3].Value = "N/A";
+            worksheet.Cells[row, 4].Value = false;
+            worksheet.Cells[row, 5].Value = false;
+            worksheet.Cells[row, 6].Value = "Access Denied";
+            worksheet.Cells[row, 7].Value = "N/A";
+            worksheet.Cells[row, 8].Value = "N/A";
+            worksheet.Cells[row, 9].Value = "N/A";
+            row++;
             return;
         }
 
@@ -522,6 +527,16 @@ class PermissionAuditTool
         }
         catch
         {
+            worksheet.Cells[row, 1].Value = dirInfo.Name;
+            worksheet.Cells[row, 2].Value = dirInfo.FullName;
+            worksheet.Cells[row, 3].Value = "N/A";
+            worksheet.Cells[row, 4].Value = false;
+            worksheet.Cells[row, 5].Value = false;
+            worksheet.Cells[row, 6].Value = "Access Denied (ACL)";
+            worksheet.Cells[row, 7].Value = "N/A";
+            worksheet.Cells[row, 8].Value = "N/A";
+            worksheet.Cells[row, 9].Value = "N/A";
+            row++;
             return;
         }
 
