@@ -1,13 +1,14 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+﻿using System.Diagnostics;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using OfficeOpenXml;
 
 class PermissionAuditTool
 {
+    static string username = null;
+    static string password = null;
+    static bool isAuthenticated = false;
+
     static void Main(string[] args)
     {
         if (args.Length == 1 && args[0].Equals("/?", StringComparison.OrdinalIgnoreCase))
@@ -19,9 +20,12 @@ class PermissionAuditTool
         bool recursiveScan = false;
         bool mergeResults = false;
         bool sharedOnly = false;
+        bool smbSharesOnly = false;
+        string serverName = null;
         List<string> directoriesToScan = new List<string>();
         string logFilePath = "ErrorLog.txt";
 
+        // Парсинг аргументов
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i].ToLower())
@@ -34,6 +38,29 @@ class PermissionAuditTool
                     break;
                 case "-sharedonly":
                     sharedOnly = true;
+                    break;
+                case "-smbsharesonly":
+                    smbSharesOnly = true;
+                    if (i + 1 < args.Length)
+                    {
+                        serverName = args[++i];
+                    }
+                    else
+                    {
+                        Console.WriteLine("Error: -smbsharesonly requires a server name.");
+                        return;
+                    }
+                    break;
+                case "-username":
+                    if (i + 1 < args.Length)
+                    {
+                        username = args[++i];
+                    }
+                    else
+                    {
+                        Console.WriteLine("Error: -username requires a value.");
+                        return;
+                    }
                     break;
                 case "-file":
                     if (i + 1 < args.Length && File.Exists(args[i + 1]))
@@ -49,7 +76,7 @@ class PermissionAuditTool
                     }
                     break;
                 default:
-                    if (Directory.Exists(args[i]))
+                    if (Directory.Exists(args[i]) || IsUncPath(args[i]))
                     {
                         directoriesToScan.Add(args[i]);
                     }
@@ -61,94 +88,109 @@ class PermissionAuditTool
             }
         }
 
-        if (directoriesToScan.Count == 0)
+        if (smbSharesOnly && string.IsNullOrWhiteSpace(serverName))
+        {
+            Console.WriteLine("Error: -smbsharesonly requires a server name.");
+            return;
+        }
+
+        if (!smbSharesOnly && directoriesToScan.Count == 0)
         {
             Console.WriteLine("No valid directories to scan. Use /? for help.");
             return;
         }
 
-        // Получаем ВСЕ расшаренные папки на машине
-        var allSharedPaths = GetSharedFoldersViaNetShare();
+        // Запрос пароля, если указан username
+        if (!string.IsNullOrEmpty(username) && string.IsNullOrEmpty(password))
+        {
+            Console.Write("Enter password for user '" + username + "': ");
+            password = ReadPassword();
+            Console.WriteLine();
+        }
 
         List<string> finalDirectories = new List<string>();
 
-        foreach (string rootPath in directoriesToScan)
+        try
         {
-            if (sharedOnly)
+            // Аутентификация через net use
+            if (!string.IsNullOrEmpty(username))
             {
-                // Фильтруем расшаренные папки: только те, что внутри rootPath
-                var sharedInRoot = allSharedPaths
-                    .Where(shared => IsSubPath(shared, rootPath))
-                    .ToList();
-
-                if (recursiveScan)
+                if (!ConnectToServer(username, password, serverName))
                 {
-                    // Также ищем расшаренные папки в подкаталогах
-                    var sharedInSubdirs = allSharedPaths
-                        .Where(shared => shared.StartsWith(rootPath, StringComparison.OrdinalIgnoreCase) && !IsDirectChild(shared, rootPath))
-                        .ToList();
-                    sharedInRoot.AddRange(sharedInSubdirs);
+                    Console.WriteLine("Failed to authenticate. Check username and password.");
+                    return;
                 }
+                isAuthenticated = true;
+            }
 
-                finalDirectories.AddRange(sharedInRoot);
+            if (smbSharesOnly)
+            {
+                var shares = GetSmbSharesFromServer(serverName);
+                finalDirectories.AddRange(shares);
             }
             else
             {
-                // Обычный режим: сканируем rootPath и подкаталоги, если recursive
-                finalDirectories.Add(rootPath);
-                if (recursiveScan)
+                foreach (string path in directoriesToScan)
                 {
-                    try
+                    if (sharedOnly)
                     {
-                        finalDirectories.AddRange(Directory.EnumerateDirectories(rootPath, "*", SearchOption.AllDirectories));
+                        var sharedPaths = GetSharedFoldersViaNetShare();
+                        finalDirectories.AddRange(sharedPaths.Where(p => IsSubPath(p, path)));
+                        if (recursiveScan)
+                        {
+                            finalDirectories.AddRange(sharedPaths.Where(p => p.StartsWith(path, StringComparison.OrdinalIgnoreCase)));
+                        }
                     }
-                    catch (UnauthorizedAccessException) { }
-                    catch (IOException) { }
+                    else
+                    {
+                        finalDirectories.Add(path);
+                        if (recursiveScan && Directory.Exists(path))
+                        {
+                            finalDirectories.AddRange(Directory.GetDirectories(path, "*", SearchOption.AllDirectories));
+                        }
+                    }
                 }
             }
-        }
 
-        finalDirectories = finalDirectories.Distinct().OrderBy(d => d).ToList();
+            finalDirectories = finalDirectories.Distinct().OrderBy(d => d).ToList();
 
-        if (finalDirectories.Count == 0)
-        {
-            Console.WriteLine("No directories to scan after filtering.");
-            return;
-        }
+            if (finalDirectories.Count == 0)
+            {
+                Console.WriteLine("No directories to scan after filtering.");
+                return;
+            }
 
-        string reportFileName = null;
+            string reportFileName = null;
 
-        try
-        {
             if (mergeResults)
             {
                 reportFileName = GenerateMergedAccessReport(finalDirectories);
             }
             else
             {
-                foreach (string directoryPath in finalDirectories)
+                foreach (string dir in finalDirectories)
                 {
-                    reportFileName = GenerateAccessReport(directoryPath);
+                    reportFileName = GenerateAccessReport(dir);
                 }
             }
 
-            // Автоматически открыть последний созданный файл
+            // Открыть отчёт
             if (!string.IsNullOrEmpty(reportFileName) && File.Exists(reportFileName))
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = reportFileName,
-                    UseShellExecute = true // Обязательно для открытия в Windows
-                });
+                Process.Start(new ProcessStartInfo(reportFileName) { UseShellExecute = true });
             }
-        }
-        catch (UnauthorizedAccessException)
-        {
-            Console.WriteLine("Access denied. Please run the application as an administrator.");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"An error occurred: {ex.Message}");
+        }
+        finally
+        {
+            // Отключение
+            if (isAuthenticated)
+            {
+                DisconnectAll();
+            }
         }
 
         if (File.Exists(logFilePath) && new FileInfo(logFilePath).Length > 0)
@@ -157,30 +199,155 @@ class PermissionAuditTool
         }
     }
 
-    static void ShowHelp()
+    static string ReadPassword()
     {
-        Console.WriteLine(@"
-Permission Audit Tool Help
-Usage: PermissionAuditTool.exe [options] <directoryPath1> [<directoryPath2> ...]
+        string password = "";
+        ConsoleKey key;
+        do
+        {
+            var keyInfo = Console.ReadKey(intercept: true);
+            key = keyInfo.Key;
+            if (key == ConsoleKey.Backspace && password.Length > 0)
+            {
+                Console.Write("\b \b");
+                password = password.Substring(0, password.Length - 1);
+            }
+            else if (!char.IsControl(keyInfo.KeyChar))
+            {
+                Console.Write("*");
+                password += keyInfo.KeyChar;
+            }
+        } while (key != ConsoleKey.Enter);
+        return password;
+    }
 
-Options:
-  -recursive      Include subdirectories in the scan.
-  -merge          Merge results from multiple directories into a single output file.
-  -sharedonly     Only scan directories that are shared (published as network shares).
-  -file <path>    Read a list of directories from a text file (one per line).
-  /?              Display this help message.
+    static bool ConnectToServer(string username, string password, string serverName)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "net",
+                Arguments = $"use \\\\{serverName}\\IPC$ /user:{username} \"{password}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
 
-Examples:
-  PermissionAuditTool.exe C:\temp
-  PermissionAuditTool.exe -recursive C:\Projects
-  PermissionAuditTool.exe -sharedonly C:\temp
-  PermissionAuditTool.exe -sharedonly -recursive C:\temp
-  PermissionAuditTool.exe -merge -sharedonly C:\temp
-  PermissionAuditTool.exe -file directories.txt
+            using (var process = Process.Start(startInfo))
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                string error = process.StandardError.ReadToEnd();
+                process.WaitForExit();
 
-Note: With -sharedonly, only shared folders within the specified path(s) will be scanned.
-The tool generates an Excel report (.xlsx) and logs errors to 'ErrorLog.txt'.
-The generated report will be opened automatically after creation.");
+                return process.ExitCode == 0;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static void DisconnectAll()
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "net",
+                Arguments = "use * /delete /y",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            Process.Start(startInfo)?.WaitForExit();
+        }
+        catch { }
+    }
+
+    static List<string> GetSmbSharesFromServer(string server)
+    {
+        var shares = new List<string>();
+
+        // Определяем, является ли сервер локальным
+        bool isLocalServer = IsLocalMachine(server);
+
+        if (isLocalServer)
+        {
+            // Используем локальный net share
+            shares = GetSharedFoldersViaNetShare();
+        }
+        else
+        {
+            // Используем удалённый PowerShell
+            try
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = $"-Command \"Get-CimInstance -ComputerName {server} -Class Win32_Share -ErrorAction Stop | Where-Object {{ $_.Type -eq 0 }} | Select-Object -ExpandProperty Path\"",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (var process = Process.Start(startInfo))
+                {
+                    string output = process.StandardOutput.ReadToEnd();
+                    process.WaitForExit();
+
+                    if (process.ExitCode == 0)
+                    {
+                        foreach (string line in output.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            string path = line.Trim();
+                            if (!string.IsNullOrEmpty(path) && Directory.Exists(path))
+                            {
+                                shares.Add(path);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Failed to retrieve shares from {server} via PowerShell.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error retrieving shares from {server}: {ex.Message}");
+            }
+        }
+
+        return shares;
+    }
+
+    static bool IsLocalMachine(string serverNameOrIp)
+    {
+        try
+        {
+            // Получаем локальные имена
+            string hostName = Environment.MachineName;
+            string fqdn = $"{hostName}.{Environment.GetEnvironmentVariable("USERDNSDOMAIN") ?? ""}".TrimEnd('.');
+            string localhostNames = "localhost,127.0.0.1,::1,.";
+
+            // Получаем локальные IP-адреса
+            var localIps = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
+                .AddressList
+                .Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                .Select(ip => ip.ToString());
+
+            // Проверяем совпадение
+            return string.Equals(serverNameOrIp, hostName, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(serverNameOrIp, fqdn, StringComparison.OrdinalIgnoreCase) ||
+                   localhostNames.Split(',').Contains(serverNameOrIp, StringComparer.OrdinalIgnoreCase) ||
+                   localIps.Contains(serverNameOrIp);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     static List<string> GetSharedFoldersViaNetShare()
@@ -188,7 +355,7 @@ The generated report will be opened automatically after creation.");
         var sharedPaths = new List<string>();
         try
         {
-            var startInfo = new System.Diagnostics.ProcessStartInfo
+            var startInfo = new ProcessStartInfo
             {
                 FileName = "net",
                 Arguments = "share",
@@ -198,15 +365,12 @@ The generated report will be opened automatically after creation.");
                 WorkingDirectory = Environment.SystemDirectory
             };
 
-            using (var process = System.Diagnostics.Process.Start(startInfo))
+            using (var process = Process.Start(startInfo))
             {
                 string output = process.StandardOutput.ReadToEnd();
                 process.WaitForExit();
 
-                string[] lines = output.Split(
-                    new[] { Environment.NewLine },
-                    StringSplitOptions.None
-                );
+                string[] lines = output.Split(new[] { Environment.NewLine }, StringSplitOptions.None);
 
                 foreach (string line in lines)
                 {
@@ -240,8 +404,12 @@ The generated report will be opened automatically after creation.");
         {
             Console.WriteLine($"Failed to retrieve shares via 'net share': {ex.Message}");
         }
-
         return sharedPaths.Distinct().ToList();
+    }
+
+    static bool IsUncPath(string path)
+    {
+        return !string.IsNullOrEmpty(path) && path.StartsWith("\\\\", StringComparison.OrdinalIgnoreCase);
     }
 
     static bool IsSubPath(string child, string parent)
@@ -251,20 +419,6 @@ The generated report will be opened automatically after creation.");
             var parentUri = new Uri(Path.GetFullPath(parent) + Path.DirectorySeparatorChar);
             var childUri = new Uri(Path.GetFullPath(child) + Path.DirectorySeparatorChar);
             return childUri.IsBaseOf(parentUri);
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    static bool IsDirectChild(string child, string parent)
-    {
-        try
-        {
-            var parentDir = new DirectoryInfo(Path.GetFullPath(parent));
-            var childDir = new DirectoryInfo(Path.GetFullPath(child));
-            return childDir.Parent?.FullName.Equals(parentDir.FullName, StringComparison.OrdinalIgnoreCase) ?? false;
         }
         catch
         {
@@ -453,5 +607,37 @@ The generated report will be opened automatically after creation.");
         catch { }
 
         Console.WriteLine($"Error: {path} - logged to '{logFilePath}'");
+    }
+
+    static void ShowHelp()
+    {
+        Console.WriteLine(@"
+Permission Audit Tool Help
+Usage: PermissionAuditTool.exe [options] <path>...
+
+Options:
+  -recursive          Scan subdirectories recursively.
+  -merge              Merge results into a single Excel file.
+  -sharedonly         Only scan directories that are shared (network shares).
+  -smbsharesonly <srv>  Retrieve and analyze all disk shares from the specified server.
+  -username <user>    Specify username for authentication (password entered interactively).
+  -file <path>        Read list of directories from a text file.
+  /?                  Show this help.
+
+Examples:
+  # Analyze local shared folders
+  PermissionAuditTool.exe -sharedonly C:\Data -recursive
+
+  # Analyze all shares on a remote server
+  PermissionAuditTool.exe -smbsharesonly fileserver01 -username CORP\Admin -merge
+
+  # Read paths from file
+  PermissionAuditTool.exe -file paths.txt
+
+Note:
+  - When using -username, password is entered securely (not echoed).
+  - Authentication is done via 'net use' and released after completion.
+  - Only disk shares (Type = 0) are processed.
+  - Generated Excel report is opened automatically.");
     }
 }
